@@ -50,10 +50,10 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 # TARGET MOTION PARAMETERS
 # ═══════════════════════════════════════════════════════════════
 
-TARGET_X = 2.0          # fixed X position (in front of drone)
+TARGET_X = 3.5          # fixed X position (in front of drone)
 TARGET_Z = 0.5          # fixed height
-TARGET_Y_MIN = -2.0     # left extent
-TARGET_Y_MAX = 2.0      # right extent
+TARGET_Y_MIN = -3.2     # left extent
+TARGET_Y_MAX = 3.2      # right extent
 TARGET_PERIOD_S = 8.0   # full cycle time (left-right-left)
 
 # Derived: speed = total_distance / half_period = 4.0 / 4.0 = 1.0 m/s

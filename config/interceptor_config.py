@@ -106,8 +106,8 @@ TARGET_SIZE_M = 0.3            # side length of the cube (meters)
 TARGET_COLOR_RGB = (1.0, 0.0, 0.0)  # red in USD (0-1 range)
 
 # Static target position (matches cam_test1.py red block)
-TARGET_STATIC_POS = (2.0, 0.0, 0.5)
-
+#TARGET_STATIC_POS = (2.0, 0.0, 0.5)
+TARGET_STATIC_POS = (4.0, 2.0, 0.5)
 # Moving target defaults (Phase 2)
 TARGET_SPEED_MS      = 1.0     # meters per second
 TARGET_X_RANGE       = (-3.0, 3.0)   # random start X range

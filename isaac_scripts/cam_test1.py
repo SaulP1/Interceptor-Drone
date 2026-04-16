@@ -155,7 +155,8 @@ class PegasusApp:
         # Add the red block to the scene
         self.add_red_block(
             prim_path="/red_block_01",
-            translation=(2.0, 0.0, 0.5),
+            translation=(2.5, 2.0, 3.5),
+            #translation=(2.0, 0.0, 0.5) original, must change interceptor_config.py TARGET_STATIC_POS to match
             scale=(0.3, 0.3, 0.3),
         )
 
