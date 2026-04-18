@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
 """
-intercept_static.py — Autonomous visual interception using PID control.
+intercept_yaw.py — Autonomous visual interception with yaw tracking.
 
-Uses visual servoing with PID: the drone steers based on what the camera
-sees, converting camera offsets to world-frame velocity commands.
+The drone TURNS to face the target instead of strafing sideways.
+This is closer to how a real interceptor works:
+  1. Rotate to point camera at target (yaw control)
+  2. Adjust altitude to match target height (vertical control)
+  3. Fly forward — speed based on depth (fast when far, slow when close)
+  4. Declare interception when depth < threshold
 
-IMPORTANT: MAVROS velocity commands are in LOCAL ENU frame (not body frame).
-  linear.x = East velocity
-  linear.y = North velocity  
-  linear.z = Up velocity
-We must rotate body-frame commands by the drone's yaw to get ENU commands.
+Control breakdown:
+  offset_norm dx → YAW rotation (turn to face target)
+  offset_norm dy → VERTICAL velocity (match target height)
+  depth          → FORWARD speed (proportional to distance)
 
 Inputs:
   /interceptor/detection    — target offset from camera center (from camera_viewer.py)
-  /quadrotor/owl/depth      — depth image to measure distance to target
-  /mavros/local_position/pose — drone position and orientation (for yaw)
+  /quadrotor/owl/depth      — depth image for distance measurement
+  /mavros/local_position/pose — drone position + orientation
 
 Outputs:
-  /mavros/setpoint_velocity/cmd_vel_unstamped — velocity commands (ENU frame)
-  /mavros/setpoint_position/local             — position commands for takeoff
+  /mavros/setpoint_raw/attitude — attitude + thrust commands (for yaw)
+  /mavros/setpoint_velocity/cmd_vel_unstamped — velocity commands (ENU)
+  /interceptor/hit — signals world script on interception
+
+Referenced from: intercept_static.py (state machine, depth sampling, detection subscriber)
+Referenced from: pi_tracker.py (yaw toward target concept — minimize the offset line)
 
 Run:
     source /opt/ros/humble/setup.bash
-    python3 ~/interceptor/perception/intercept_static.py
+    python3 ~/interceptor/perception/intercept_yaw.py
 
-Then in another terminal, set OFFBOARD and arm:
+Then in another terminal:
     ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode "{base_mode: 0, custom_mode: 'OFFBOARD'}"
     ros2 service call /mavros/cmd/arming mavros_msgs/srv/CommandBool "{value: true}"
-
-Requires: PX4 + MAVROS + Isaac Sim + camera_viewer.py all running.
 """
 
 import sys
@@ -44,9 +49,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import Twist, PoseStamped
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from mavros_msgs.msg import State
-from std_msgs.msg import Bool
+from mavros_msgs.srv import CommandBool, SetMode
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -57,21 +62,31 @@ from std_msgs.msg import Bool
 TAKEOFF_ALT = 0.5
 TAKEOFF_SETTLE_TIME = 2.0
 
-# Forward speed (proportional to depth)
-MAX_FORWARD_SPEED = 4.0
-MIN_FORWARD_SPEED = 0.3
-DEPTH_FAR = 8.0
-DEPTH_CLOSE = 1.0
+# Forward speed
+MAX_FORWARD_SPEED = 4.0          # m/s — hardware speed limit
+MAX_DECEL = 3.0                  # m/s² — max braking deceleration (tune by testing)
 
-# PID Gains — Lateral (left/right steering)
-LATERAL_KP = 2.0
-LATERAL_KI = 0.1
-LATERAL_KD = 0.5
+# YAW PID — controls how aggressively the drone turns to face the target
+# This is the key difference from intercept_static.py
+# Higher P = snappier rotation toward target
+# Higher D = dampens yaw oscillation (prevents spinning back and forth)
+YAW_KP = 1.5          # rad/s per unit offset — how fast to turn
+YAW_KI = 0.05         # fixes persistent yaw drift
+YAW_KD = 0.9          # dampens yaw oscillation
 
-# PID Gains — Vertical (up/down steering)
-VERTICAL_KP = 1.5
+# Camera horizontal FOV in radians (~90° from our lens settings)
+# Used to convert pixel offset to angular offset
+CAMERA_HFOV_RAD = math.radians(90.0)
+
+# VERTICAL PID — up/down to match target height
+VERTICAL_KP = 8.0
 VERTICAL_KI = 0.08
 VERTICAL_KD = 0.4
+
+# Small lateral PID for fine corrections (residual after yaw)
+LATERAL_KP = 0.5
+LATERAL_KI = 0.02
+LATERAL_KD = 0.15
 
 # Interception
 INTERCEPT_DEPTH = 0.3
@@ -81,9 +96,10 @@ INTERCEPT_CONFIRM_FRAMES = 10
 HOVER_TIMEOUT = 30.0
 
 # Safety
-MAX_ALTITUDE = 20.0
+MAX_ALTITUDE = 50.0
 MIN_ALTITUDE = 0.3
 MAX_VELOCITY = 5.0
+MAX_YAW_RATE = 1.5    # rad/s — max yaw rotation speed
 
 # Depth sampling
 DEPTH_PATCH_RADIUS = 10
@@ -97,12 +113,6 @@ CONTROL_DT = 0.05  # 20Hz
 # ═══════════════════════════════════════════════════════════════
 
 class PIDController:
-    """
-    PID controller for one axis.
-    
-    output = Kp * error + Ki * integral(error) + Kd * d(error)/dt
-    """
-
     def __init__(self, kp, ki, kd, integral_max=2.0):
         self.kp = kp
         self.ki = ki
@@ -114,18 +124,15 @@ class PIDController:
 
     def compute(self, error, dt):
         p_term = self.kp * error
-
         self.integral += error * dt
         self.integral = max(-self.integral_max, min(self.integral_max, self.integral))
         i_term = self.ki * self.integral
-
         if self.first_call:
             derivative = 0.0
             self.first_call = False
         else:
             derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
         d_term = self.kd * derivative
-
         self.prev_error = error
         return p_term + i_term + d_term
 
@@ -136,35 +143,34 @@ class PIDController:
 
 
 # ═══════════════════════════════════════════════════════════════
-# QUATERNION TO YAW HELPER
+# QUATERNION HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 def quaternion_to_yaw(x, y, z, w):
-    """
-    Extract yaw angle from quaternion.
-    
-    Returns yaw in radians. Yaw is the rotation around the Z (up) axis.
-    0 = facing East (+X in ENU), pi/2 = facing North (+Y in ENU).
-    
-    This tells us which direction the drone's camera is pointing
-    so we can convert body-frame commands to world-frame commands.
-    """
+    """Extract yaw (radians) from quaternion. 0=East, pi/2=North in ENU."""
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-class InterceptController(Node):
-    """
-    Visual servoing intercept controller with PID.
+def yaw_to_quaternion(yaw):
+    """Convert yaw angle (radians) to quaternion (x, y, z, w)."""
+    return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
 
-    State machine:
-      INIT → TAKEOFF → INTERCEPT → DONE
-      (SEARCH state entered if target lost during INTERCEPT)
+
+class InterceptYawController(Node):
+    """
+    Visual servoing with yaw tracking.
+
+    Instead of strafing to center the target, the drone ROTATES
+    to face it and then flies forward. This keeps the target
+    near camera center naturally.
+
+    State machine: INIT → TAKEOFF → INTERCEPT → DONE
     """
 
     def __init__(self):
-        super().__init__("intercept_controller")
+        super().__init__("intercept_yaw_controller")
 
         # ── State ──
         self.state = "INIT"
@@ -172,21 +178,23 @@ class InterceptController(Node):
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_z = 0.0
-        self.current_yaw = 0.0  # radians, ENU frame
+        self.current_yaw = 0.0
+        self.target_yaw = 0.0  # desired yaw angle
         self.start_time = time.time()
 
-        # ── Detection data ──
+        # ── Detection ──
         self.latest_detection = None
         self.detection_time = 0.0
         self.detection_lock = threading.Lock()
 
-        # ── Depth data ──
+        # ── Depth ──
         self.latest_depth = None
         self.depth_lock = threading.Lock()
 
         # ── PID controllers ──
-        self.pid_lateral = PIDController(LATERAL_KP, LATERAL_KI, LATERAL_KD)
+        self.pid_yaw = PIDController(YAW_KP, YAW_KI, YAW_KD)
         self.pid_vertical = PIDController(VERTICAL_KP, VERTICAL_KI, VERTICAL_KD)
+        self.pid_lateral = PIDController(LATERAL_KP, LATERAL_KI, LATERAL_KD)
 
         # ── Intercept tracking ──
         self.close_frame_count = 0
@@ -206,6 +214,10 @@ class InterceptController(Node):
             depth=5,
         )
 
+        # Services
+        self.arm_client = self.create_client (CommandBool, "/mavros/cmd/arming")
+        self.mode_client = self.create_client(SetMode, "/mavros/set_mode")
+
         # ── Subscribers ──
         self.create_subscription(State, "/mavros/state", self._on_mavros_state, mavros_qos)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose", self._on_pose, mavros_qos)
@@ -217,16 +229,17 @@ class InterceptController(Node):
         self.pos_pub = self.create_publisher(PoseStamped, "/mavros/setpoint_position/local", mavros_qos)
         self.hit_pub = self.create_publisher(Bool, "/interceptor/hit", 10)
 
-        # ── Control loop 20Hz ──
+        # ── Control loop ──
         self.timer = self.create_timer(CONTROL_DT, self._control_loop)
         self.loop_count = 0
 
         self.get_logger().info("=" * 55)
-        self.get_logger().info("  INTERCEPTOR — PID Visual Servoing Controller")
+        self.get_logger().info("  INTERCEPTOR — Yaw Tracking Controller")
         self.get_logger().info("=" * 55)
-        self.get_logger().info(f"  Lateral  PID: P={LATERAL_KP} I={LATERAL_KI} D={LATERAL_KD}")
+        self.get_logger().info(f"  Yaw PID: P={YAW_KP} I={YAW_KI} D={YAW_KD}")
         self.get_logger().info(f"  Vertical PID: P={VERTICAL_KP} I={VERTICAL_KI} D={VERTICAL_KD}")
         self.get_logger().info(f"  Max fwd speed: {MAX_FORWARD_SPEED} m/s")
+        self.get_logger().info(f"  Max yaw rate: {MAX_YAW_RATE} rad/s")
         self.get_logger().info(f"  Intercept depth: {INTERCEPT_DEPTH}m")
         self.get_logger().info("  Waiting for MAVROS connection...")
 
@@ -261,108 +274,72 @@ class InterceptController(Node):
         except Exception as e:
             self.get_logger().warn(f"Depth convert failed: {e}")
 
-    # ═══════════════════════════════════════════════════════
+
     # DEPTH SAMPLING
-    # ═══════════════════════════════════════════════════════
+
 
     def _get_target_depth(self):
         with self.detection_lock:
             det = self.latest_detection
         with self.depth_lock:
             depth = self.latest_depth
-
         if det is None or depth is None:
             return -1.0
-
         cx, cy = det["center_px"]
         h, w = depth.shape[:2]
         r = DEPTH_PATCH_RADIUS
         y0, y1 = max(0, cy - r), min(h, cy + r + 1)
         x0, x1 = max(0, cx - r), min(w, cx + r + 1)
-
         patch = depth[y0:y1, x0:x1]
         valid = patch[np.isfinite(patch) & (patch > 0.1)]
         if len(valid) == 0:
             return -1.0
         return float(np.median(valid))
 
-    # ═══════════════════════════════════════════════════════
+
     # COMMAND HELPERS
-    # ═══════════════════════════════════════════════════════
+
 
     def _clamp(self, value, limit):
         return max(-limit, min(limit, value))
 
-    def _send_body_velocity(self, forward, right, up):
+    def _send_position_yaw(self, x, y, z, yaw):
+        """Send position + yaw setpoint."""
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = float(z)
+        qx, qy, qz, qw = yaw_to_quaternion(yaw)
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        self.pos_pub.publish(msg)
+
+    def _send_body_velocity_with_yaw(self, forward, right, up, yaw_rate):
         """
-        Send velocity in BODY frame — automatically converts to ENU.
+        Send velocity in body frame + yaw rate.
 
-        Body frame (what the camera sees):
-          forward = toward where camera points
-          right   = to the right of camera
-          up      = straight up
-
-        ENU frame (what MAVROS expects):
-          x = East
-          y = North
-          z = Up
-
-        Conversion uses the drone's current yaw:
-          enu_x = forward * cos(yaw) - right * sin(yaw)  ... wait, let me think...
-
-        Actually:
-          forward (body) = direction the drone faces
-          If yaw=0, drone faces East (+X in ENU)
-          If yaw=pi/2, drone faces North (+Y in ENU)
-
-        So:
-          vel_east  = forward * cos(yaw) + right * (-sin(yaw))
-          vel_north = forward * sin(yaw) + right * cos(yaw)
-
-        But "right" in body frame is perpendicular to forward:
-          right_east  = -sin(yaw) ... no.
-
-        Let me be precise:
-          Body forward direction in ENU: (cos(yaw), sin(yaw))
-          Body right direction in ENU:   (sin(yaw), -cos(yaw))
-          
-        Wait — ENU right of forward:
-          If forward = (cos(yaw), sin(yaw)), 
-          then right = rotate forward by -90° = (sin(yaw), -cos(yaw))
-
-        So:
-          vel_east  = forward * cos(yaw) + right * sin(yaw)
-          vel_north = forward * sin(yaw) + right * (-cos(yaw))
-          vel_up    = up
+        Converts body forward/right to ENU using current yaw,
+        then adds yaw_rate as angular.z for rotation.
         """
         yaw = self.current_yaw
-
-        vel_east  = forward * math.cos(yaw) + right * math.sin(yaw)
+        vel_east = forward * math.cos(yaw) + right * math.sin(yaw)
         vel_north = forward * math.sin(yaw) - right * math.cos(yaw)
-        vel_up    = up
 
         msg = Twist()
         msg.linear.x = self._clamp(float(vel_east), MAX_VELOCITY)
         msg.linear.y = self._clamp(float(vel_north), MAX_VELOCITY)
-        msg.linear.z = self._clamp(float(vel_up), MAX_VELOCITY)
+        msg.linear.z = self._clamp(float(up), MAX_VELOCITY)
+        msg.angular.z = self._clamp(float(yaw_rate), MAX_YAW_RATE)
         self.vel_pub.publish(msg)
 
-    def _send_position(self, x=0.0, y=0.0, z=0.0):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.position.x = x
-        msg.pose.position.y = y
-        msg.pose.position.z = z
-        msg.pose.orientation.w = 1.0
-        self.pos_pub.publish(msg)
 
-    # ═══════════════════════════════════════════════════════
     # CONTROL LOOP
-    # ═══════════════════════════════════════════════════════
 
     def _control_loop(self):
         self.loop_count += 1
-
         if self.state == "INIT":
             self._state_init()
         elif self.state == "TAKEOFF":
@@ -374,10 +351,11 @@ class InterceptController(Node):
         elif self.state == "DONE":
             self._state_done()
 
-    # ── INIT ──
+    # INIT
 
     def _state_init(self):
-        self._send_position(0.0, 0.0, TAKEOFF_ALT)
+        # Pre-stream position setpoints (PX4 requires this before OFFBOARD)
+        self._send_position_yaw(0.0, 0.0, TAKEOFF_ALT, self.current_yaw)
 
         if self.mavros_state.mode == "":
             return
@@ -391,26 +369,47 @@ class InterceptController(Node):
         if self.loop_count < 60:
             return
 
-        if self.loop_count == 60:
-            self.get_logger().info(
-                "\nReady. In another terminal, set OFFBOARD and arm:\n"
-                "  source /opt/ros/humble/setup.bash\n"
-                "  ros2 service call /mavros/set_mode mavros_msgs/srv/SetMode "
-                "\"{base_mode: 0, custom_mode: 'OFFBOARD'}\"\n"
-                "  ros2 service call /mavros/cmd/arming mavros_msgs/srv/CommandBool "
-                "\"{value: true}\"\n"
-            )
-
+        # Already armed and in OFFBOARD — proceed
         if self.mavros_state.armed and self.mavros_state.mode == "OFFBOARD":
             self.get_logger().info("Armed and OFFBOARD — taking off")
+            self.target_yaw = self.current_yaw
             self.state = "TAKEOFF"
             self.start_time = time.time()
+            return
+
+        # Try to set OFFBOARD and arm (only once)
+        if self.loop_count == 60:
+            self.get_logger().info("Setting OFFBOARD and arming...")
+            thread = threading.Thread(target=self._arm_in_background, daemon=True)
+            thread.start()
+
+    def _arm_in_background(self):
+        """Run arming sequence in background thread to avoid blocking the control loop."""
+        try:
+            # Set OFFBOARD
+            mode_req = SetMode.Request()
+            mode_req.custom_mode = "OFFBOARD"
+            future = self.mode_client.call_async(mode_req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5)
+            if future.result() is not None:
+                self.get_logger().info(f"Set mode result: {future.result().mode_sent}")
+
+            time.sleep(0.5)
+
+            # Arm
+            arm_req = CommandBool.Request()
+            arm_req.value = True
+            future = self.arm_client.call_async(arm_req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5)
+            if future.result() is not None:
+                self.get_logger().info(f"Arm result: {future.result().success}")
+        except Exception as e:
+            self.get_logger().warn(f"Arming failed: {e}. Use Terminal 6 manually.")
 
     # ── TAKEOFF ──
 
     def _state_takeoff(self):
-        self._send_position(0.0, 0.0, TAKEOFF_ALT)
-
+        self._send_position_yaw(0.0, 0.0, TAKEOFF_ALT, self.target_yaw)
         elapsed = time.time() - self.start_time
 
         if self.loop_count % 40 == 0:
@@ -421,11 +420,11 @@ class InterceptController(Node):
 
         if elapsed > TAKEOFF_SETTLE_TIME and self.current_z > TAKEOFF_ALT * 0.5:
             self.get_logger().info(
-                f"Takeoff complete — alt={self.current_z:.2f}m, "
-                f"yaw={math.degrees(self.current_yaw):.1f}°. Intercepting..."
+                f"Takeoff complete — alt={self.current_z:.2f}m. Intercepting..."
             )
-            self.pid_lateral.reset()
+            self.pid_yaw.reset()
             self.pid_vertical.reset()
+            self.pid_lateral.reset()
             self.last_control_time = time.time()
             self.state = "INTERCEPT"
             self.close_frame_count = 0
@@ -434,18 +433,18 @@ class InterceptController(Node):
     # ── SEARCH ──
 
     def _state_search(self):
-        self._send_body_velocity(0.0, 0.0, 0.0)
+        self._send_body_velocity_with_yaw(0.0, 0.0, 0.0, 0.0)
 
         with self.detection_lock:
             det = self.latest_detection
             det_time = self.detection_time
-
         det_age = time.time() - det_time if det is not None else 999.0
 
         if det is not None and det_age < 1.0:
             self.get_logger().info("TARGET ACQUIRED — switching to INTERCEPT")
-            self.pid_lateral.reset()
+            self.pid_yaw.reset()
             self.pid_vertical.reset()
+            self.pid_lateral.reset()
             self.last_control_time = time.time()
             self.state = "INTERCEPT"
             self.close_frame_count = 0
@@ -454,12 +453,10 @@ class InterceptController(Node):
         elapsed = time.time() - self.start_time
         if self.loop_count % 60 == 0:
             self.get_logger().info(f"[SEARCH] Waiting for detection... ({elapsed:.0f}s)")
-
         if elapsed > HOVER_TIMEOUT:
-            self.get_logger().warn(f"No detection after {HOVER_TIMEOUT}s — still searching")
             self.start_time = time.time()
 
-    # ── INTERCEPT ──
+    # INTERCEPT (yaw tracking)
 
     def _state_intercept(self):
         now = time.time()
@@ -469,12 +466,11 @@ class InterceptController(Node):
         with self.detection_lock:
             det = self.latest_detection
             det_time = self.detection_time
-
         det_age = now - det_time if det is not None else 999.0
 
-        # Lost target — hover
+        # Lost target
         if det is None or det_age > 2.0:
-            self._send_body_velocity(0.0, 0.0, 0.0)
+            self._send_body_velocity_with_yaw(0.0, 0.0, 0.0, 0.0)
             if self.loop_count % 40 == 0:
                 self.get_logger().warn("[INTERCEPT] Lost target — hovering")
             if det_age > 5.0:
@@ -483,34 +479,38 @@ class InterceptController(Node):
                 self.start_time = time.time()
             return
 
-        # Camera offset (error for PID)
         dx_norm, dy_norm = det["offset_norm"]
-
-        # Depth to target
         target_depth = self._get_target_depth()
 
-        # ── PID: Lateral (left/right) ──
-        # dx_norm > 0 = target is RIGHT of center
-        # PID output > 0 when target is right = we need to move right
-        # In body frame: right is positive
-        right_vel = self.pid_lateral.compute(dx_norm, dt)
+        # ── YAW: Turn to face the target ──
+        # dx_norm is the horizontal offset in the image, range [-1, 1]
+        # Convert to angular error: how many radians off-center is the target?
+        # If camera HFOV is 90°, then dx_norm=1.0 means target is 45° to the right
+        yaw_error = dx_norm * (CAMERA_HFOV_RAD / 2.0)
 
-        # ── PID: Vertical (up/down) ──
-        # dy_norm > 0 = target is BELOW center
-        # We need to move down = negative up velocity
+        # PID computes yaw rate (rad/s) to correct the error
+        # Positive error (target right) → negative yaw rate (turn right in ENU)
+        # In ENU: positive angular.z = counter-clockwise = turn left
+        yaw_rate = -self.pid_yaw.compute(yaw_error, dt)
+        yaw_rate = self._clamp(yaw_rate, MAX_YAW_RATE)
+
+        # ── VERTICAL: Move up/down to match target height ──
         vertical_vel = -self.pid_vertical.compute(dy_norm, dt)
-
-        # Clamp altitude
         if self.current_z > MAX_ALTITUDE:
             vertical_vel = min(vertical_vel, 0.0)
         if self.current_z < MIN_ALTITUDE:
             vertical_vel = max(vertical_vel, 0.0)
 
-        # ── Forward speed (proportional to depth) ──
+        # ── LATERAL: Small residual correction ──
+        # After yaw brings the target roughly to center, this handles
+        # the remaining pixel-level offset for precision
+        right_vel = self.pid_lateral.compute(dx_norm, dt)
+
+        # ── FORWARD: Speed based on depth ──
         if target_depth > 0:
-            depth_fraction = (target_depth - DEPTH_CLOSE) / (DEPTH_FAR - DEPTH_CLOSE)
-            depth_fraction = max(0.0, min(1.0, depth_fraction))
-            forward_vel = MIN_FORWARD_SPEED + depth_fraction * (MAX_FORWARD_SPEED - MIN_FORWARD_SPEED)
+            platform_limit = 12.0
+            stopping_limit = math.sqrt(2 * MAX_DECEL * max(0.1, target_depth)) #ensures you can break to zero by the time you reach the target, with some margin for error
+            forward_vel = min(platform_limit, stopping_limit, MAX_FORWARD_SPEED) 
 
             # Check interception
             if target_depth < INTERCEPT_DEPTH:
@@ -532,10 +532,10 @@ class InterceptController(Node):
                 self.close_frame_count = 0
         else:
             area = det.get("area_px", 0)
-            forward_vel = MIN_FORWARD_SPEED if area > 10000 else MAX_FORWARD_SPEED * 0.5
+            forward_vel = 0.5 if area > 10000 else MAX_FORWARD_SPEED * 0.5
 
-        # Send body-frame velocity (automatically converted to ENU)
-        self._send_body_velocity(forward_vel, right_vel, vertical_vel)
+        # Send command: body velocity + yaw rate
+        self._send_body_velocity_with_yaw(forward_vel, right_vel, vertical_vel, yaw_rate)
 
         # Log
         if self.loop_count % 20 == 0:
@@ -543,23 +543,31 @@ class InterceptController(Node):
             self.get_logger().info(
                 f"[INTERCEPT] depth={depth_str} "
                 f"offset=({dx_norm:+.2f},{dy_norm:+.2f}) "
-                f"vel_body=(fwd={forward_vel:.2f}, right={right_vel:.2f}, up={vertical_vel:.2f}) "
+                f"yaw_err={math.degrees(yaw_error):+.1f}° "
+                f"yaw_rate={yaw_rate:+.2f}rad/s "
+                f"fwd={forward_vel:.2f} "
                 f"yaw={math.degrees(self.current_yaw):.1f}° "
                 f"close={self.close_frame_count}"
             )
 
-    # ── DONE ──
+    # END STATE UPON INTERECPTION
 
     def _state_done(self):
-        self._send_body_velocity(0.0, 0.0, 0.0)
-        if self.loop_count % 100 == 0:
-            self.get_logger().info("[DONE] Intercepted — hovering in place")
+        self._send_body_velocity_with_yaw(0.0, 0.0, 0.0, 0.0)
+        if not hasattr(self, '_done_time'):
+            self._done_time = time.time()
+        if time.time() - self._done_time > 3.0:
+            self.get_logger().info("[DONE] Shutting down.")
+            raise SystemExit(0)
+        if self.loop_count % 20 == 0:
+            remaining = 3.0 - (time.time() - self._done_time)
+            self.get_logger().info(f"[DONE] Intercepted — shutting down in {remaining:.1f}s")
+
 
 
 def main():
     rclpy.init()
-    node = InterceptController()
-
+    node = InterceptYawController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
