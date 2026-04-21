@@ -41,16 +41,26 @@ from interceptor_config import (
     SAVE_DEBUG_FRAMES,
     DEBUG_FRAME_INTERVAL,
     MAX_DEBUG_FRAMES,
+    DETECTION_MODE,
     print_config,
 )
-from color_detector import ColorDetector
+if DETECTION_MODE == "yolo":
+    from yolo_detector import YoloDetector  
+    print("[camera_viewer] Using YOLO detector")
+else:
+    from color_detector import ColorDetector
+    print("[camera_viewer] Using HSV color detector")
+
 
 
 class CameraViewer(Node):
     def __init__(self):
         super().__init__("camera_viewer")
 
-        self.detector = ColorDetector()
+        if DETECTION_MODE == "yolo":
+            self.detector = YoloDetector()
+        else:
+            self.detector = ColorDetector()
         self.frame_count = 0
         self.detection_count = 0
         self.saved_count = 0

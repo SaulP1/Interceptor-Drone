@@ -152,6 +152,13 @@ MAX_DEBUG_FRAMES     = 500
 # CONVENIENCE
 # ═══════════════════════════════════════════════════════════════
 
+DETECTION_MODE = 'color'
+
+YOLO_MODEL_PATH = "yolov8s.pt"
+YOLO_CONFIDENCE = 0.6
+YOLO_TARGET_CLASS = "car"
+YOLO_INPUT_SIZE = 1280
+
 def print_config():
     """Print config summary for verification."""
     print(f"[config] Project dir: {PROJECT_DIR}")

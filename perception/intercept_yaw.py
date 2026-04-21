@@ -59,7 +59,7 @@ from mavros_msgs.srv import CommandBool, SetMode
 # ═══════════════════════════════════════════════════════════════
 
 # Takeoff
-TAKEOFF_ALT = 0.5
+TAKEOFF_ALT = 0.5 
 TAKEOFF_SETTLE_TIME = 2.0
 
 # Forward speed
@@ -78,7 +78,7 @@ YAW_KD = 0.9          # dampens yaw oscillation
 # Used to convert pixel offset to angular offset
 CAMERA_HFOV_RAD = math.radians(90.0)
 
-# VERTICAL PID — up/down to match target height
+# PID - correction on error, correct on past error, dampen based on error change rate
 VERTICAL_KP = 8.0
 VERTICAL_KI = 0.08
 VERTICAL_KD = 0.4
@@ -92,13 +92,15 @@ LATERAL_KD = 0.15
 INTERCEPT_DEPTH = 0.3
 INTERCEPT_CONFIRM_FRAMES = 10
 
+
+
 # Search
 HOVER_TIMEOUT = 30.0
 
 # Safety
 MAX_ALTITUDE = 50.0
 MIN_ALTITUDE = 0.3
-MAX_VELOCITY = 5.0
+MAX_VELOCITY = 3.0
 MAX_YAW_RATE = 1.5    # rad/s — max yaw rotation speed
 
 # Depth sampling
@@ -218,18 +220,18 @@ class InterceptYawController(Node):
         self.arm_client = self.create_client (CommandBool, "/mavros/cmd/arming")
         self.mode_client = self.create_client(SetMode, "/mavros/set_mode")
 
-        # ── Subscribers ──
+        # Subscribers
         self.create_subscription(State, "/mavros/state", self._on_mavros_state, mavros_qos)
         self.create_subscription(PoseStamped, "/mavros/local_position/pose", self._on_pose, mavros_qos)
         self.create_subscription(String, "/interceptor/detection", self._on_detection, 10)
         self.create_subscription(Image, "/quadrotor/owl/depth", self._on_depth, reliable_qos)
 
-        # ── Publishers ──
+        # Publishers
         self.vel_pub = self.create_publisher(Twist, "/mavros/setpoint_velocity/cmd_vel_unstamped", 10)
         self.pos_pub = self.create_publisher(PoseStamped, "/mavros/setpoint_position/local", mavros_qos)
         self.hit_pub = self.create_publisher(Bool, "/interceptor/hit", 10)
 
-        # ── Control loop ──
+        # Control loop
         self.timer = self.create_timer(CONTROL_DT, self._control_loop)
         self.loop_count = 0
 
@@ -278,7 +280,7 @@ class InterceptYawController(Node):
     # DEPTH SAMPLING
 
 
-    def _get_target_depth(self):
+    def _get_target_depth(self): 
         with self.detection_lock:
             det = self.latest_detection
         with self.depth_lock:
@@ -406,7 +408,7 @@ class InterceptYawController(Node):
         except Exception as e:
             self.get_logger().warn(f"Arming failed: {e}. Use Terminal 6 manually.")
 
-    # ── TAKEOFF ──
+    # TAKEOFF
 
     def _state_takeoff(self):
         self._send_position_yaw(0.0, 0.0, TAKEOFF_ALT, self.target_yaw)
@@ -430,7 +432,7 @@ class InterceptYawController(Node):
             self.close_frame_count = 0
             self.start_time = time.time()
 
-    # ── SEARCH ──
+    # SEARCH
 
     def _state_search(self):
         self._send_body_velocity_with_yaw(0.0, 0.0, 0.0, 0.0)

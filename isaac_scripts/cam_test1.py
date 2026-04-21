@@ -80,7 +80,7 @@ class PegasusApp:
         cam_graph = ROS2CameraGraph(
             camera_prim_path="body/owl/camera",
             config={
-                "resolution": [640, 480],
+                "resolution": [1920, 1080],
                 "types": ["rgb", "depth", "camera_info"],
                 "namespace": "",
                 "topic": "/owl",
